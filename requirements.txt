@@ -1,0 +1,22 @@
+# Core — always required
+numpy>=1.24
+scipy>=1.11
+torch>=2.0
+pandas>=2.0
+matplotlib>=3.7
+scikit-learn>=1.3
+pyarrow>=14.0          # for parquet output
+
+# Mesh loading (at least one is strongly recommended)
+trimesh>=4.0           # primary loader; also handles scene merging
+meshio>=5.3            # fallback for formats trimesh can't read
+# pymeshlab            # optional heavy fallback (OS-specific)
+
+# Visualization (optional)
+umap-learn>=0.5        # for UMAP embedding projection
+
+# Checkpoint convenience (used in OfficialPointMAE wrapper)
+# easydict>=1.10       # only if using the official Point-MAE repo
+
+# Development
+tqdm>=4.65

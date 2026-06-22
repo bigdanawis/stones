@@ -1,0 +1,32 @@
+# Data — raw mesh files
+wrl/
+
+# Model checkpoints
+pth/
+
+# Pipeline outputs
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# Environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
