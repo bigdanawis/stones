@@ -28,9 +28,9 @@ all objects.  This keeps relative depths comparable across stones.
 Usage
 -----
   python scripts/demo_dino7ch_embed.py
-  python scripts/demo_dino7ch_embed.py --save_renders
   python scripts/demo_dino7ch_embed.py --skip_clean
   python scripts/demo_dino7ch_embed.py --decimate --target_ratio 0.05
+  python scripts/demo_dino7ch_embed.py --reload_scale outputs/global_scale.json
   python scripts/demo_dino7ch_embed.py --pca_only    # replot cached embeddings
 """
 from __future__ import annotations
@@ -40,6 +40,7 @@ import json
 import sys
 import traceback
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -76,7 +77,8 @@ N_CH       = 7
 PATCH_SIZE = 14
 
 WRL_DIR      = ROOT / "wrl"
-OUTPUT_DIR   = ROOT / "outputs" / "dino_7ch_v2"
+OUTPUT_BASE  = ROOT / "outputs" / "dino_7ch_v2"   # timestamped subfolder added at runtime
+SCALE_DIR    = ROOT / "outputs"                    # global_scale.json always lives here
 XLSX_DEFAULT = WRL_DIR / "Handaxes 2026 list with sites.xlsx"
 
 
@@ -143,7 +145,7 @@ def find_global_params(
     return scale, canvas_W, canvas_H, max_z
 
 
-SCALE_FILE = ROOT / "outputs" / "global_scale.json"
+SCALE_FILE = SCALE_DIR / "global_scale.json"
 
 
 def save_global_params(scale: float, canvas_W: int, canvas_H: int,
@@ -533,7 +535,8 @@ def _run_plots(stems, embeddings, out, site_map, notes_map, seed):
 def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--wrl_dir",         default=str(WRL_DIR))
-    p.add_argument("--output_dir",      default=str(OUTPUT_DIR))
+    p.add_argument("--output_dir",      default=str(OUTPUT_BASE),
+                   help="Base output folder; a timestamp subfolder is created inside")
     p.add_argument("--site_xlsx",       default=str(XLSX_DEFAULT),
                    help="Excel file mapping WRL stems to sites (optional)")
     p.add_argument("--no_site_color",   action="store_true")
@@ -608,7 +611,8 @@ def _process_mesh(path: Path, args) -> tuple[np.ndarray, np.ndarray] | None:
 def main():
     args   = parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    out    = ensure_dir(Path(args.output_dir))
+    stamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out    = ensure_dir(Path(args.output_dir) / stamp)
     emb_dir = out / "embeddings"
     emb_dir.mkdir(parents=True, exist_ok=True)
 
