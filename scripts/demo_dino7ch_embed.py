@@ -159,17 +159,38 @@ def save_global_params(scale: float, canvas_W: int, canvas_H: int,
 
 
 def load_global_params(path: Path = SCALE_FILE) -> tuple[float, int, int, float]:
-    with open(path) as fh:
-        d = json.load(fh)
-    scale, canvas_W, canvas_H, max_z = (
-        float(d["scale"]), int(d["canvas_W"]),
-        int(d["canvas_H"]), float(d["max_z_range"]),
-    )
-    log.info(
-        f"Global scale loaded from {path}\n"
-        f"  scale={scale:.3f} px/unit  canvas={canvas_W}x{canvas_H}"
-        f"  max_z_range={max_z:.4f}"
-    )
+    """
+    Load global scale params from either format:
+      .json  — full dict with scale, canvas_W, canvas_H, max_z_range
+      .txt   — legacy single-float (scale only); canvas derived from IMAGE_SIZE/MARGIN,
+               max_z_range defaults to 1.0 (depth channel will span [0, 1] relative to
+               each object's own Z range rather than a dataset-wide range).
+    """
+    path = Path(path)
+    if path.suffix == ".txt":
+        scale = float(path.read_text().strip())
+        inner = IMAGE_SIZE * (1.0 - 2.0 * MARGIN)
+        # Legacy files used a square canvas; reconstruct from IMAGE_SIZE and MARGIN.
+        canvas_W = canvas_H = IMAGE_SIZE
+        max_z = 1.0
+        log.warning(
+            f"Loaded legacy .txt scale from {path}\n"
+            f"  scale={scale:.3f} px/unit  canvas assumed {canvas_W}x{canvas_H} (square)\n"
+            f"  max_z_range defaulted to 1.0 — depth channel is per-object relative\n"
+            f"  Re-run without --reload_scale to compute full params from data."
+        )
+    else:
+        with open(path) as fh:
+            d = json.load(fh)
+        scale    = float(d["scale"])
+        canvas_W = int(d["canvas_W"])
+        canvas_H = int(d["canvas_H"])
+        max_z    = float(d["max_z_range"])
+        log.info(
+            f"Global scale loaded from {path}\n"
+            f"  scale={scale:.3f} px/unit  canvas={canvas_W}x{canvas_H}"
+            f"  max_z_range={max_z:.4f}"
+        )
     return scale, canvas_W, canvas_H, max_z
 
 
