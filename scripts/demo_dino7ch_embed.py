@@ -36,6 +36,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import traceback
 import warnings
@@ -138,6 +139,33 @@ def find_global_params(
         f"  max X={max_x:.4f}  max Y={max_y:.4f}  max Z={max_z:.4f}  "
         f"scale={scale:.3f} px/unit  canvas={canvas_W}x{canvas_H}  "
         f"max_z_range={max_z:.4f}"
+    )
+    return scale, canvas_W, canvas_H, max_z
+
+
+SCALE_FILE = ROOT / "outputs" / "global_scale.json"
+
+
+def save_global_params(scale: float, canvas_W: int, canvas_H: int,
+                       max_z_range: float, path: Path = SCALE_FILE) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump({"scale": scale, "canvas_W": canvas_W,
+                   "canvas_H": canvas_H, "max_z_range": max_z_range}, fh, indent=2)
+    log.info(f"Global scale saved → {path}")
+
+
+def load_global_params(path: Path = SCALE_FILE) -> tuple[float, int, int, float]:
+    with open(path) as fh:
+        d = json.load(fh)
+    scale, canvas_W, canvas_H, max_z = (
+        float(d["scale"]), int(d["canvas_W"]),
+        int(d["canvas_H"]), float(d["max_z_range"]),
+    )
+    log.info(
+        f"Global scale loaded from {path}\n"
+        f"  scale={scale:.3f} px/unit  canvas={canvas_W}x{canvas_H}"
+        f"  max_z_range={max_z:.4f}"
     )
     return scale, canvas_W, canvas_H, max_z
 
@@ -284,13 +312,20 @@ def render_7ch(
 
 
 def save_renders(img7: np.ndarray, stem: str, rd: Path) -> None:
-    """Save 7-channel float image as three diagnostic PNGs."""
-    def to_uint8(arr):
+    """
+    Save the 7-channel image as three PNGs inside `rd/`:
+      <stem>_top.png   — RGB  top-surface normals
+      <stem>_bot.png   — RGB  bottom-surface normals
+      <stem>_depth.png — L (grayscale) top-surface depth
+    """
+    rd.mkdir(parents=True, exist_ok=True)
+
+    def to_uint8(arr: np.ndarray) -> np.ndarray:
         return (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
+
     Image.fromarray(to_uint8(img7[:, :, :3])).save(rd / f"{stem}_top.png")
     Image.fromarray(to_uint8(img7[:, :, 3:6])).save(rd / f"{stem}_bot.png")
-    dep = to_uint8(np.repeat(img7[:, :, 6:7], 3, axis=2))
-    Image.fromarray(dep).save(rd / f"{stem}_depth.png")
+    Image.fromarray(to_uint8(img7[:, :, 6]), mode="L").save(rd / f"{stem}_depth.png")
 
 
 # ---------------------------------------------------------------------------
@@ -507,8 +542,8 @@ def parse_args():
     p.add_argument("--image_size",      type=int, default=IMAGE_SIZE,
                    help="Square canvas size fed to DINOv2 (multiple of 14)")
     p.add_argument("--device",          default=None)
-    p.add_argument("--save_renders",    action="store_true",
-                   help="Save per-object channel PNGs to outputs/renders/")
+    p.add_argument("--reload_scale",    default=None, metavar="JSON",
+                   help="Path to a saved global_scale.json; skip pass-1 scan")
     p.add_argument("--limit",           type=int, default=None,
                    help="Process only the first N WRL files")
     p.add_argument("--skip_clean",      action="store_true",
@@ -597,10 +632,16 @@ def main():
         return
     log.info(f"Found {len(files)} WRL files")
 
-    # Pass 1 — global scale and depth range
-    scale, canvas_W, canvas_H, max_z_range = find_global_params(
-        files, args.image_size, MARGIN
-    )
+    # Pass 1 — global scale and depth range (or reload from file)
+    if args.reload_scale:
+        scale, canvas_W, canvas_H, max_z_range = load_global_params(
+            Path(args.reload_scale)
+        )
+    else:
+        scale, canvas_W, canvas_H, max_z_range = find_global_params(
+            files, args.image_size, MARGIN
+        )
+        save_global_params(scale, canvas_W, canvas_H, max_z_range)
 
     # Load 7-channel DINOv2
     model = build_dino7ch(args.dino_model, device=device)
@@ -611,8 +652,7 @@ def main():
         f"  skip_clean={args.skip_clean}  decimate={args.decimate}"
     )
 
-    if args.save_renders:
-        (out / "renders").mkdir(parents=True, exist_ok=True)
+    renders_dir = out / "renders"
 
     stems:      list[str]        = []
     embeddings: list[np.ndarray] = []
@@ -637,8 +677,7 @@ def main():
 
                 img7 = render_7ch(v, f, scale, canvas_H, canvas_W, max_z_range)
 
-                if args.save_renders:
-                    save_renders(img7, stem, out / "renders")
+                save_renders(img7, stem, renders_dir)
 
                 emb = embed_7ch(model, img7, device, args.image_size)
                 np.save(emb_path, emb)
