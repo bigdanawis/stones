@@ -31,7 +31,8 @@ Usage
   python scripts/demo_dino7ch_embed.py --skip_clean
   python scripts/demo_dino7ch_embed.py --decimate --target_ratio 0.05
   python scripts/demo_dino7ch_embed.py --reload_scale outputs/global_scale.json
-  python scripts/demo_dino7ch_embed.py --pca_only    # replot cached embeddings
+  python scripts/demo_dino7ch_embed.py --pca_only                        # replot latest run
+  python scripts/demo_dino7ch_embed.py --pca_only --run_dir outputs/dino_7ch_v2/20260622_143012
 """
 from __future__ import annotations
 
@@ -557,7 +558,10 @@ def parse_args():
     p.add_argument("--target_ratio",    type=float, default=0.05)
     p.add_argument("--decimate_method", default="qem", choices=["qem", "cluster"])
     p.add_argument("--pca_only",        action="store_true",
-                   help="Skip rendering; reload cached embeddings and replot")
+                   help="Skip rendering; reload embeddings from an existing run and replot")
+    p.add_argument("--run_dir",         default=None, metavar="DIR",
+                   help="Stamped run folder to use with --pca_only "
+                        "(default: most recent subfolder under --output_dir)")
     p.add_argument("--seed",            type=int, default=42)
     return p.parse_args()
 
@@ -608,33 +612,52 @@ def _process_mesh(path: Path, args) -> tuple[np.ndarray, np.ndarray] | None:
 # Main
 # ---------------------------------------------------------------------------
 
+def _latest_run(base: Path) -> Path | None:
+    """Return the most recently modified timestamped subfolder, or None."""
+    runs = sorted(
+        (d for d in base.iterdir() if d.is_dir()),
+        key=lambda d: d.stat().st_mtime,
+        reverse=True,
+    )
+    return runs[0] if runs else None
+
+
 def main():
-    args   = parse_args()
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    stamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out    = ensure_dir(Path(args.output_dir) / stamp)
-    emb_dir = out / "embeddings"
-    emb_dir.mkdir(parents=True, exist_ok=True)
-
+    args        = parse_args()
     site_map, notes_map = _load_site_and_notes(args)
+    base_dir    = Path(args.output_dir)
 
-    # --pca_only: reload cached embeddings and replot
+    # --pca_only: work on an existing stamped run, never create a new folder
     if args.pca_only:
-        files = sorted(emb_dir.glob("*.npy"))
+        if args.run_dir:
+            out = Path(args.run_dir)
+        else:
+            out = _latest_run(base_dir)
+            if out is None:
+                log.error(f"No run folders found under {base_dir}")
+                return
+        emb_dir = out / "embeddings"
+        files   = sorted(emb_dir.glob("*.npy"))
         if not files:
-            log.error(f"No embeddings found in {emb_dir}  (run without --pca_only first)")
+            log.error(f"No embeddings found in {emb_dir}")
             return
         stems      = [f.stem for f in files]
         embeddings = [np.load(f) for f in files]
-        log.info(f"Loaded {len(stems)} cached embeddings  dim={embeddings[0].shape[0]}")
+        log.info(f"Replotting {len(stems)} embeddings from {out}")
         _run_plots(stems, embeddings, out, site_map, notes_map, args.seed)
         return
+
+    # Normal run — create a fresh stamped folder, touch nothing else
+    device  = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    stamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out     = ensure_dir(base_dir / stamp)
+    emb_dir = ensure_dir(out / "embeddings")
 
     files = collect_mesh_files(args.wrl_dir, limit=args.limit)
     if not files:
         log.error(f"No WRL files found in {args.wrl_dir}")
         return
-    log.info(f"Found {len(files)} WRL files")
+    log.info(f"Found {len(files)} WRL files  →  {out}")
 
     # Pass 1 — global scale and depth range (or reload from file)
     if args.reload_scale:
@@ -657,41 +680,30 @@ def main():
     )
 
     renders_dir = out / "renders"
-
     stems:      list[str]        = []
     embeddings: list[np.ndarray] = []
 
-    # Pass 2 — render + embed
+    # Pass 2 — render every mesh fresh into the new stamped folder
     for i, path in enumerate(files, 1):
-        stem     = path.stem
-        emb_path = emb_dir / f"{stem}.npy"
-
-        if emb_path.exists():
-            emb = np.load(emb_path)
-            stems.append(stem)
-            embeddings.append(emb)
-            log.info(f"[{i}/{len(files)}] {stem}  (cached)")
-        else:
-            log.info(f"[{i}/{len(files)}] {stem}")
-            try:
-                result = _process_mesh(path, args)
-                if result is None:
-                    continue
-                v, f = result
-
-                img7 = render_7ch(v, f, scale, canvas_H, canvas_W, max_z_range)
-
-                save_renders(img7, stem, renders_dir)
-
-                emb = embed_7ch(model, img7, device, args.image_size)
-                np.save(emb_path, emb)
-                stems.append(stem)
-                embeddings.append(emb)
-                log.info(f"  embed   dim={emb.shape[0]}")
-
-            except Exception:
-                log.error(f"  Failed:\n{traceback.format_exc()[-400:]}")
+        log.info(f"[{i}/{len(files)}] {path.stem}")
+        try:
+            result = _process_mesh(path, args)
+            if result is None:
                 continue
+            v, f = result
+
+            img7 = render_7ch(v, f, scale, canvas_H, canvas_W, max_z_range)
+            save_renders(img7, path.stem, renders_dir)
+
+            emb = embed_7ch(model, img7, device, args.image_size)
+            np.save(emb_dir / f"{path.stem}.npy", emb)
+            stems.append(path.stem)
+            embeddings.append(emb)
+            log.info(f"  embed   dim={emb.shape[0]}")
+
+        except Exception:
+            log.error(f"  Failed:\n{traceback.format_exc()[-400:]}")
+            continue
 
         if len(embeddings) >= 2:
             _run_plots(stems, embeddings, out, site_map, notes_map, args.seed)
