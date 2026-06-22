@@ -571,13 +571,17 @@ class NTXentLoss(nn.Module):
 
 
 def _set_trainable(model: nn.Module, n_unfreeze_blocks: int) -> None:
-    """Freeze everything, then unfreeze patch_embed and the last n_unfreeze_blocks."""
+    """Freeze everything, then unfreeze patch_embed and the last n_unfreeze_blocks.
+    Pass -1 to unfreeze the entire network."""
     for p in model.parameters():
         p.requires_grad_(False)
+    if n_unfreeze_blocks == -1:
+        for p in model.parameters():
+            p.requires_grad_(True)
+        return
     for p in model.patch_embed.parameters():
         p.requires_grad_(True)
-    blocks = list(model.blocks)
-    for blk in blocks[-n_unfreeze_blocks:]:
+    for blk in list(model.blocks)[-n_unfreeze_blocks:]:
         for p in blk.parameters():
             p.requires_grad_(True)
 
@@ -795,6 +799,8 @@ def parse_args():
                         "(default: most recent subfolder under --output_dir)")
     p.add_argument("--renders_dir",     default=str(RENDERS_DIR), metavar="DIR",
                    help="Directory of pre-rendered PNGs; skip Pass 2 if all renders present")
+    p.add_argument("--ft_blocks",       type=int, default=2,
+                   help="Transformer blocks to unfreeze during finetuning; -1 = all")
     p.add_argument("--seed",            type=int, default=42)
     return p.parse_args()
 
@@ -912,16 +918,14 @@ def main():
         f"  skip_clean={args.skip_clean}  decimate={args.decimate}"
     )
 
-    src_renders = Path(args.renders_dir)
-    renders_dir = ensure_dir(out / "renders")
+    renders_dir = ensure_dir(Path(args.renders_dir))
     stems: list[str] = []
 
-    # Pass 2 — render every mesh; use --renders_dir as source if PNG already present
+    # Pass 2 — render every mesh into renders_dir; skip if PNG already present
     for i, path in enumerate(files, 1):
         log.info(f"[{i}/{len(files)}] {path.stem}")
-        cached = src_renders / f"{path.stem}_top.png"
-        if cached.exists():
-            log.info(f"  render cached from {src_renders} — skipping")
+        if (renders_dir / f"{path.stem}_top.png").exists():
+            log.info(f"  render cached — skipping")
             stems.append(path.stem)
             continue
         try:
@@ -940,13 +944,10 @@ def main():
         log.error("No renders produced.")
         return
 
-    # Pass 3 — finetune with SimCLR (loads renders from disk on demand)
-    def _iter_images():
-        for stem in stems:
-            yield load_img7(stem, renders_dir)
-
+    # Pass 3 — finetune with SimCLR
     model = finetune_simclr(
-        model, list(_iter_images()), device, img_size=args.image_size
+        model, [load_img7(stem, renders_dir) for stem in stems],
+        device, img_size=args.image_size, n_unfreeze_blocks=args.ft_blocks
     )
 
     # Pass 4 — embed with finetuned model
