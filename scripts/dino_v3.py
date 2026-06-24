@@ -1,10 +1,11 @@
 """
 DINOv2 embedding pipeline for stone tool WRL meshes — 7-channel image input.
 
-Network input: a 7-channel image [H, W, 7] per stone, composed of:
+Network input: an 8-channel image [H, W, 8] per stone, composed of:
   ch 0-2  top-surface normals    (Nx, Ny, Nz), encoded as (n+1)/2 ∈ [0,1]
   ch 3-5  bottom-surface normals (Nx, Ny, Nz), encoded as (n+1)/2 ∈ [0,1]
-  ch 6    top-surface Z-depth,   encoded as (Z - Z_base) / global_max_Z_range
+  ch 6    local thickness        (Z_top − Z_bottom) / global_max_Z_range; 0 where only one surface visible
+  ch 7    dihedral angle         dot(top_n, −bottom_n) encoded as (d+1)/2 ∈ [0,1]; 0 where only one surface visible
 
 All normals are guaranteed to point away from the mesh centroid.
 
@@ -18,12 +19,19 @@ each stone's geometry is placed at the common scale so relative sizes and aspect
 ratios are preserved.  The canvas is zero-padded to a square before being fed
 to the DINOv2 transformer.
 
-Depth convention
-----------------
-Depth at each (X, Y) pixel is the Z-coordinate of the top (highest-Z) visible
-surface at that point.  It is expressed relative to the object's own Z minimum
-(so 0 = base of the object) and normalised by the global maximum Z-range across
-all objects.  This keeps relative depths comparable across stones.
+Thickness convention
+--------------------
+Thickness at each (X, Y) pixel is the Z-gap between the topmost top-facing face
+and the bottommost bottom-facing face projected to that pixel.  It is normalised
+by the global maximum Z-range so thicknesses are comparable across stones.
+Pixels where only one surface is visible carry 0.
+
+Dihedral convention
+-------------------
+The dihedral channel encodes dot(top_n, −bottom_n), the cosine of the angle
+between the opposing surface normals at each pixel.  Values near 1 indicate a
+sharp edge (normals nearly anti-parallel); values near 0 indicate a blunt
+cross-section.  Pixels where only one surface is visible carry 0.
 
 Usage
 -----
@@ -38,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import traceback
 import warnings
@@ -76,14 +85,15 @@ log = get_logger("dino7ch_embed")
 IMAGE_SIZE = 224
 MARGIN     = 0.05        # fraction of each canvas axis kept as black border
 DINO_MODEL = "dinov2_vits14"
-N_CH       = 7
+N_CH       = 8
 PATCH_SIZE = 14
 
 WRL_DIR      = ROOT / "wrl"
 OUTPUT_BASE  = ROOT / "outputs" / "dino_7ch_v2"   # timestamped subfolder added at runtime
 SCALE_DIR    = ROOT / "outputs"                    # global_scale.json always lives here
 RENDERS_DIR  = ROOT / "outputs" / "renders"        # shared renders reused across runs
-XLSX_DEFAULT = WRL_DIR / "Handaxes 2026 list with sites.xlsx"
+XLSX_DEFAULT  = WRL_DIR / "Handaxes 2026 list with sites.xlsx"
+XLSX_METADATA = WRL_DIR / "Handaxes2026list_with_sites_and_metadata.xlsx"
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +102,14 @@ XLSX_DEFAULT = WRL_DIR / "Handaxes 2026 list with sites.xlsx"
 
 def _raw_extents(path: Path) -> tuple[float, float, float]:
     """
-    Load raw vertices (no cleaning) and return (X_extent, Y_extent, Z_extent).
+    Load raw vertices (no cleaning) and return (longest, intermediate, shortest) extents.
+    Sorted so that pass-1 canvas sizing is correct regardless of how the mesh is oriented
+    in its file (stones are not always stored with the long axis along X).
     Returns (0, 0, 0) on failure.
     """
     try:
         v = load_mesh(path)["vertices"]
-        ext = v.max(axis=0) - v.min(axis=0)
+        ext = np.sort(v.max(axis=0) - v.min(axis=0))[::-1]   # descending
         return float(ext[0]), float(ext[1]), float(ext[2])
     except Exception:
         return 0.0, 0.0, 0.0
@@ -113,13 +125,14 @@ def find_global_params(
 
       scale       — pixels per world-unit, chosen so the object with the
                     largest extent in X or Y fills `img_size*(1-2*margin)` px.
-      canvas_W    — image width in pixels  = ceil(max_X_all * scale + 2*margin_px)
-      canvas_H    — image height in pixels = ceil(max_Y_all * scale + 2*margin_px)
-      max_z_range — maximum Z-extent (top - bottom) across all objects;
-                    used to normalise the depth channel globally.
+      canvas_W    — image width  = ceil(max_longest_extent   * scale + 2*margin_px)
+      canvas_H    — image height = ceil(max_intermediate_extent * scale + 2*margin_px)
+      max_z_range — maximum shortest extent (thickness) across all objects;
+                    used to normalise the thickness channel globally.
 
-    max_X and max_Y are tracked independently so the canvas reflects the true
-    largest width and height across the dataset.
+    Extents from each mesh are sorted largest→smallest before accumulation so
+    canvas sizing is correct regardless of how individual meshes are oriented in
+    their source files.
     """
     log.info(f"Pass 1: scanning {len(files)} meshes for global scale & depth …")
     max_x = max_y = max_z = 0.0
@@ -222,7 +235,9 @@ def _poly_render(
     fig.subplots_adjust(0, 0, 1, 1)
     ax.set_xlim(0, canvas_W)
     ax.set_ylim(0, canvas_H)
-    ax.set_aspect("equal")
+    # No set_aspect("equal"): px/py are already in pixel units so the 1:1 mapping
+    # holds without the constraint.  Forcing equal aspect on a non-square canvas
+    # shrinks the axes and exposes figure-background strips that render red.
     ax.axis("off")
     ax.set_facecolor((0, 0, 0))
     fig.patch.set_facecolor((0, 0, 0))
@@ -232,7 +247,8 @@ def _poly_render(
 
     fig.canvas.draw()
     w, h = fig.canvas.get_width_height()
-    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+    # buffer_rgba() is the modern replacement for the deprecated tostring_rgb()
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[:, :, :3].copy()
     plt.close(fig)
 
     if h != canvas_H or w != canvas_W:
@@ -256,13 +272,22 @@ def render_7ch(
     All normals are flipped so they point away from the mesh centroid before
     splitting into top / bottom views.
 
-    Returns [canvas_H, canvas_W, 7] float32 in [0, 1]:
+    Returns [canvas_H, canvas_W, 8] float32 in [0, 1]:
       ch 0-2  top-surface normal  (Nx, Ny, Nz) encoded as (n+1)/2
-      ch 3-5  bottom-surface normal
-      ch 6    top-surface Z-depth, (Z - Z_min) / global_max_z_range
+      ch 3-5  bottom-surface normal encoded as (n+1)/2
+      ch 6    thickness (Z_top − Z_bottom) / norm_range; 0 where only one surface visible
+      ch 7    dihedral dot(top_n, −bot_n) encoded as (d+1)/2; 0 where only one surface visible
     """
+    # ---- Step 0: align to principal axes so the thin axis = Z (top view = XY projection) ----
+    # SVD on the centred vertex cloud: Vt rows are principal axes ordered largest→smallest
+    # variance.  Rotating into this frame means axis-0 = length, axis-1 = width, axis-2 =
+    # depth/thickness.  Looking down from +Z always gives the archaeological "top view".
+    centred = vertices - vertices.mean(axis=0)
+    _, _, Vt = np.linalg.svd(centred, full_matrices=False)  # Vt: [3, 3], rows = axes
+    vertices = centred @ Vt.T                               # [V, 3], centroid at origin
+
     # ---- Step 1: face normals, oriented away from centroid ----
-    centroid = vertices.mean(axis=0)
+    centroid = vertices.mean(axis=0)   # = (0,0,0) after centering above
 
     normals = compute_face_normals(vertices, faces).copy()  # [F, 3]
 
@@ -318,45 +343,75 @@ def render_7ch(
     else:
         bot_f = np.zeros((canvas_H, canvas_W, 3), np.float32)
 
-    # ---- Step 6: depth channel (top-surface Z, globally normalised) ----
-    if len(top_idx):
-        z_base = float(pz.min())
-        z_vals = avg_z[top_idx] - z_base          # shift so object base = 0
-        if global_max_z_range > 1e-10:
-            d = np.clip(z_vals / global_max_z_range, 0.0, 1.0)
-        else:
-            d = np.full(len(top_idx), 0.5, dtype=np.float32)
-        rgb = _poly_render(
-            tris[top_idx],
-            np.stack([d, d, d], axis=1),
-            canvas_H, canvas_W,
-        )
-        dep_f = rgb[:, :, :1].astype(np.float32) / 255.0   # keep only 1 ch
-    else:
-        dep_f = np.zeros((canvas_H, canvas_W, 1), np.float32)
+    # ---- Step 6: depth renders for thickness (top and bottom Z, same normalisation) ----
+    z_base     = float(pz.min())
+    z_range    = float(pz.max() - pz.min())
+    norm_range = max(global_max_z_range, z_range, 1e-10)
+    d_min      = 1.0 / 255.0   # sentinel: stone base > 0 so background (0) is distinct
 
-    return np.concatenate([top_f, bot_f, dep_f], axis=2)   # [H, W, 7]
+    if len(top_idx):
+        z_top_vals = avg_z[top_idx] - z_base
+        d_top = d_min + (1.0 - d_min) * np.clip(z_top_vals / norm_range, 0.0, 1.0)
+        rgb = _poly_render(tris[top_idx], np.stack([d_top, d_top, d_top], axis=1), canvas_H, canvas_W)
+        top_dep = rgb[:, :, 0].astype(np.float32) / 255.0   # [H, W]
+    else:
+        top_dep = np.zeros((canvas_H, canvas_W), np.float32)
+
+    # bot_idx already sorted highest-Z first → lowest-Z face wins at each pixel = stone underside
+    if len(bot_idx):
+        z_bot_vals = avg_z[bot_idx] - z_base
+        d_bot = d_min + (1.0 - d_min) * np.clip(z_bot_vals / norm_range, 0.0, 1.0)
+        rgb = _poly_render(tris[bot_idx], np.stack([d_bot, d_bot, d_bot], axis=1), canvas_H, canvas_W)
+        bot_dep = rgb[:, :, 0].astype(np.float32) / 255.0   # [H, W]
+    else:
+        bot_dep = np.zeros((canvas_H, canvas_W), np.float32)
+
+    # ---- Step 7: thickness = Z_top - Z_bottom (only where both surfaces visible) ----
+    thresh       = d_min / 2.0
+    top_present  = top_dep > thresh
+    bot_present  = bot_dep > thresh
+    thick        = np.zeros((canvas_H, canvas_W, 1), np.float32)
+    both         = top_present & bot_present
+    thick[both, 0] = np.clip(top_dep[both] - bot_dep[both], 0.0, 1.0)
+
+    # ---- Step 8: dihedral angle between opposing surface normals ----
+    top_n     = top_f * 2.0 - 1.0                                      # decode → [-1, 1]
+    bot_n     = bot_f * 2.0 - 1.0
+    top_n_hat = top_n / np.maximum(np.linalg.norm(top_n, axis=2, keepdims=True), 1e-8)
+    bot_n_hat = bot_n / np.maximum(np.linalg.norm(bot_n, axis=2, keepdims=True), 1e-8)
+    raw       = (top_n_hat * (-bot_n_hat)).sum(axis=2)                  # [H, W] ∈ [-1, 1]
+    dih       = np.clip((raw + 1.0) * 0.5, 0.0, 1.0)                   # → [0, 1]
+    top_vis   = top_f.sum(axis=2) > (1.5 / 255.0)
+    bot_vis   = bot_f.sum(axis=2) > (1.5 / 255.0)
+    dih[~(top_vis & bot_vis)] = 0.0
+    dihedral_f = dih[:, :, np.newaxis]                                  # [H, W, 1]
+
+    return np.concatenate([top_f, bot_f, thick, dihedral_f], axis=2)   # [H, W, 8]
 
 
 def load_img7(stem: str, rd: Path) -> np.ndarray:
     """
-    Reconstruct a 7-channel [H, W, 7] float32 image from the three PNGs
+    Reconstruct an 8-channel [H, W, 8] float32 image from the four PNGs
     written by save_renders.  Inverse of save_renders.
     """
-    top   = np.array(Image.open(rd / f"{stem}_top.png"),   dtype=np.float32) / 255.0
-    bot   = np.array(Image.open(rd / f"{stem}_bot.png"),   dtype=np.float32) / 255.0
-    depth = np.array(Image.open(rd / f"{stem}_depth.png"), dtype=np.float32) / 255.0
-    if depth.ndim == 2:
-        depth = depth[:, :, np.newaxis]
-    return np.concatenate([top, bot, depth], axis=2)   # [H, W, 7]
+    top  = np.array(Image.open(rd / f"{stem}_top.png"),      dtype=np.float32) / 255.0
+    bot  = np.array(Image.open(rd / f"{stem}_bot.png"),      dtype=np.float32) / 255.0
+    thk  = np.array(Image.open(rd / f"{stem}_thick.png"),    dtype=np.float32) / 255.0
+    dih  = np.array(Image.open(rd / f"{stem}_dihedral.png"), dtype=np.float32) / 255.0
+    if thk.ndim == 2:
+        thk = thk[:, :, np.newaxis]
+    if dih.ndim == 2:
+        dih = dih[:, :, np.newaxis]
+    return np.concatenate([top, bot, thk, dih], axis=2)   # [H, W, 8]
 
 
 def save_renders(img7: np.ndarray, stem: str, rd: Path) -> None:
     """
-    Save the 7-channel image as three PNGs inside `rd/`:
-      <stem>_top.png   — RGB  top-surface normals
-      <stem>_bot.png   — RGB  bottom-surface normals
-      <stem>_depth.png — L (grayscale) top-surface depth
+    Save the 8-channel image as four PNGs inside `rd/`:
+      <stem>_top.png      — RGB  top-surface normals
+      <stem>_bot.png      — RGB  bottom-surface normals
+      <stem>_thick.png    — L (grayscale) thickness
+      <stem>_dihedral.png — L (grayscale) dihedral angle
     """
     rd.mkdir(parents=True, exist_ok=True)
 
@@ -365,7 +420,8 @@ def save_renders(img7: np.ndarray, stem: str, rd: Path) -> None:
 
     Image.fromarray(to_uint8(img7[:, :, :3])).save(rd / f"{stem}_top.png")
     Image.fromarray(to_uint8(img7[:, :, 3:6])).save(rd / f"{stem}_bot.png")
-    Image.fromarray(to_uint8(img7[:, :, 6]), mode="L").save(rd / f"{stem}_depth.png")
+    Image.fromarray(to_uint8(img7[:, :, 6]), mode="L").save(rd / f"{stem}_thick.png")
+    Image.fromarray(to_uint8(img7[:, :, 7]), mode="L").save(rd / f"{stem}_dihedral.png")
 
 
 # ---------------------------------------------------------------------------
@@ -395,9 +451,9 @@ def build_dino7ch(
     with torch.no_grad():
         w_orig = old.weight.data                              # [D, 3, P, P]
         w_mean = w_orig.mean(dim=1, keepdim=True)            # [D, 1, P, P]
-        # ch 0-5: two copies of the pretrained RGB weights
-        # ch 6:   channel-average of the pretrained RGB weights
-        new.weight.data = torch.cat([w_orig, w_orig, w_mean], dim=1)  # [D, 7, P, P]
+        # ch 0-5: two copies of the pretrained RGB weights (top + bottom normals)
+        # ch 6-7: channel-average (thickness, dihedral — scalar channels)
+        new.weight.data = torch.cat([w_orig, w_orig, w_mean, w_mean], dim=1)  # [D, 8, P, P]
         if has_bias:
             new.bias.data = old.bias.data.clone()
     model.patch_embed.proj = new
@@ -427,7 +483,7 @@ def embed_7ch(
     img_size: int = IMAGE_SIZE,
 ) -> np.ndarray:
     """
-    Embed a 7-channel float32 [H, W, 7] image via the widened DINOv2.
+    Embed an 8-channel float32 [H, W, 8] image via the widened DINOv2.
 
     1. Zero-pad to a square canvas (largest of H, W).
     2. Resize to img_size × img_size if the square is not already that size.
@@ -439,7 +495,7 @@ def embed_7ch(
 
     # Pad to square (centre the object)
     if H != W:
-        padded = np.zeros((sq, sq, 7), dtype=np.float32)
+        padded = np.zeros((sq, sq, N_CH), dtype=np.float32)
         ph = (sq - H) // 2
         pw = (sq - W) // 2
         padded[ph:ph + H, pw:pw + W] = img7
@@ -454,7 +510,7 @@ def embed_7ch(
                 ).resize((img_size, img_size), Image.BILINEAR),
                 dtype=np.float32,
             ) / 255.0
-            for c in range(7)
+            for c in range(N_CH)
         ]
         img7 = np.stack(channels, axis=2)
 
@@ -505,11 +561,11 @@ def _augment_pair(img7: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _img7_to_tensor(img7: np.ndarray, device: torch.device, img_size: int) -> torch.Tensor:
-    """[H, W, 7] float32 → [1, 7, img_size, img_size] tensor on device, normalised to [-1, 1]."""
+    """[H, W, 8] float32 → [1, 8, img_size, img_size] tensor on device, normalised to [-1, 1]."""
     H, W, _ = img7.shape
     sq = max(H, W)
     if H != W:
-        padded = np.zeros((sq, sq, 7), dtype=np.float32)
+        padded = np.zeros((sq, sq, N_CH), dtype=np.float32)
         ph, pw = (sq - H) // 2, (sq - W) // 2
         padded[ph:ph + H, pw:pw + W] = img7
         img7 = padded
@@ -521,7 +577,7 @@ def _img7_to_tensor(img7: np.ndarray, device: torch.device, img_size: int) -> to
                 ).resize((img_size, img_size), Image.BILINEAR),
                 dtype=np.float32,
             ) / 255.0
-            for c in range(7)
+            for c in range(N_CH)
         ]
         img7 = np.stack(channels, axis=2)
     t = torch.from_numpy(img7.transpose(2, 0, 1)).unsqueeze(0).to(device)
@@ -588,7 +644,7 @@ def _set_trainable(model: nn.Module, n_unfreeze_blocks: int) -> None:
 
 def finetune_simclr(
     model: nn.Module,
-    images: list[np.ndarray],       # [H, W, 7] float32, one per stone
+    images: list[np.ndarray],       # [H, W, 8] float32, one per stone
     device: torch.device,
     n_epochs: int = 10,
     lr: float = 1e-4,
@@ -632,9 +688,10 @@ def finetune_simclr(
 
             views_orig, views_aug = [], []
             for i in batch_idx:
-                orig, aug = _augment_pair(images[i])
-                views_orig.append(_img7_to_tensor(orig, device, img_size))
-                views_aug.append(_img7_to_tensor(aug,  device, img_size))
+                _, view1 = _augment_pair(images[i])
+                _, view2 = _augment_pair(images[i])
+                views_orig.append(_img7_to_tensor(view1, device, img_size))
+                views_aug.append(_img7_to_tensor(view2,  device, img_size))
 
             t_orig = torch.cat(views_orig, dim=0)   # [B, 7, H, W]
             t_aug  = torch.cat(views_aug,  dim=0)
@@ -752,7 +809,441 @@ def plot_umap(stems, embeddings, out, site_map=None, notes_map=None, seed=42):
         pass
 
 
-def _run_plots(stems, embeddings, out, site_map, notes_map, seed):
+# ---------------------------------------------------------------------------
+# Attention analysis
+# ---------------------------------------------------------------------------
+
+def _align_to_y_axis(img7: np.ndarray) -> np.ndarray:
+    """
+    Rotate img7 so the stone's longest spatial axis aligns with the Y (vertical)
+    image axis.  Uses PCA on the non-background pixel coordinates to find the
+    principal axis, then applies the same spatial + normal-XY correction as
+    _augment_pair.  Returns the rotated [H, W, 8] float32.
+    """
+    mask = img7[:, :, :3].sum(axis=2) > (1.5 / 255.0)   # non-background from top normals
+    ys, xs = np.where(mask)
+    if len(ys) < 10:
+        return img7                    # too few pixels to determine axis
+
+    coords  = np.stack([ys, xs], axis=1).astype(np.float64)
+    coords -= coords.mean(axis=0)
+    cov     = (coords.T @ coords) / len(coords)
+    _, evecs = np.linalg.eigh(cov)
+    principal = evecs[:, -1]           # [e_row, e_col] — direction of max variance
+
+    # Angle from vertical (row axis).  Normalise to [-90, 90] so we always
+    # rotate by at most 90° (axis is undirected).
+    angle = np.degrees(np.arctan2(principal[1], principal[0]))
+    if angle > 90:
+        angle -= 180
+    elif angle < -90:
+        angle += 180
+    theta     = -angle                 # rotate this much to align with Y
+    theta_rad = np.deg2rad(theta)
+    cos_t, sin_t = np.cos(theta_rad), np.sin(theta_rad)
+
+    rotated = nd_rotate(img7, angle=theta, axes=(0, 1), reshape=False,
+                        mode="constant", cval=0.0).astype(np.float32)
+    rotated = np.clip(rotated, 0.0, 1.0)
+
+    for x_ch, y_ch in ((0, 1), (3, 4)):
+        nx = rotated[:, :, x_ch] * 2.0 - 1.0
+        ny = rotated[:, :, y_ch] * 2.0 - 1.0
+        rotated[:, :, x_ch] = np.clip((cos_t * nx - sin_t * ny + 1.0) * 0.5, 0.0, 1.0)
+        rotated[:, :, y_ch] = np.clip((sin_t * nx + cos_t * ny + 1.0) * 0.5, 0.0, 1.0)
+
+    return rotated
+
+
+def extract_attention(
+    model: nn.Module,
+    img7: np.ndarray,
+    device: torch.device,
+    img_size: int = IMAGE_SIZE,
+) -> np.ndarray:
+    """
+    Extract CLS-to-patch attention from the last transformer block.
+
+    Temporarily patches the attention module's forward so the softmax attention
+    matrix is captured regardless of whether fused_attn / attn_drop is an
+    nn.Module or a bare float (as in some DINOv2 builds).
+
+    Returns [n_heads, patch_h, patch_w] float32.
+    """
+    t       = _img7_to_tensor(img7, device, img_size)
+    store   = {}
+    attn_mod = model.blocks[-1].attn
+
+    def _patched_forward(x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        nh       = attn_mod.num_heads
+        head_dim = C // nh
+        qkv = attn_mod.qkv(x).reshape(B, N, 3, nh, head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        if hasattr(attn_mod, 'q_norm'):   # newer DINOv2 builds
+            q, k = attn_mod.q_norm(q), attn_mod.k_norm(k)
+        scale = getattr(attn_mod, 'scale', head_dim ** -0.5)
+        attn  = (q * scale) @ k.transpose(-2, -1)
+        attn  = attn.softmax(dim=-1)
+        store['attn'] = attn.detach().cpu()   # [B, n_heads, N+1, N+1]
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = attn_mod.proj(x)
+        if hasattr(attn_mod, 'proj_drop'):
+            x = attn_mod.proj_drop(x)
+        return x
+
+    orig = attn_mod.forward
+    attn_mod.forward = _patched_forward
+    try:
+        with torch.no_grad():
+            model(t)
+    finally:
+        attn_mod.forward = orig
+
+    attn     = store['attn'][0]         # [n_heads, N+1, N+1]
+    cls_attn = attn[:, 0, 1:].numpy()  # [n_heads, N]  CLS row, drop CLS col
+    ph = pw  = int(cls_attn.shape[1] ** 0.5)
+    return cls_attn.reshape(-1, ph, pw) # [n_heads, ph, pw]
+
+
+def compute_channel_attribution(
+    model: nn.Module,
+    img7: np.ndarray,
+    device: torch.device,
+    img_size: int = IMAGE_SIZE,
+) -> np.ndarray:
+    """
+    Gradient attribution split by input channel group.
+
+    Backprops the squared L2 norm of the CLS token to the 7-channel input.
+    |∂(‖CLS‖²)/∂input| is summed within each of the three channel groups,
+    then averaged spatially to patch resolution.
+
+    Returns [4, ph, pw] float32:
+      [0]  top normals    (ch 0-2)
+      [1]  bottom normals (ch 3-5)
+      [2]  thickness      (ch 6)
+      [3]  dihedral       (ch 7)
+    """
+    # .detach() makes this a leaf tensor so t.grad accumulates after backward()
+    t = _img7_to_tensor(img7, device, img_size).detach().requires_grad_(True)  # [1, 7, H, W]
+    with torch.enable_grad():
+        cls = model(t)                     # [1, D]
+        cls.pow(2).sum().backward()
+
+    # Gradient × Input: incorporates actual pixel values so groups with equal
+    # patch-embed weights (ch0-2 vs ch3-5) still produce distinct spatial maps.
+    attrib = (t.grad * t.detach()).abs()[0]  # [7, img_size, img_size]
+    groups = torch.stack([
+        attrib[0:3].sum(0),                # top normals
+        attrib[3:6].sum(0),                # bottom normals
+        attrib[6],                         # thickness
+        attrib[7],                         # dihedral
+    ]).detach().cpu().numpy()              # [4, img_size, img_size]
+    return groups
+
+
+def plot_channel_attribution(
+    stems: list[str],
+    model: nn.Module,
+    renders_dir: Path,
+    out: Path,
+    device: torch.device,
+    img_size: int = IMAGE_SIZE,
+) -> None:
+    """
+    For each stone save a 2×3 figure:
+      top row    — input reference images: top normals (RGB), bottom normals (RGB), depth (grey)
+      bottom row — gradient attribution heatmaps for each channel group
+
+    Attribution maps are upscaled from patch resolution using NEAREST so the
+    ViT patch grid is visible.
+    """
+    attn_dir    = ensure_dir(out / "attention")
+    group_names = ["Top normals", "Bottom normals", "Thickness", "Dihedral"]
+
+    for stem in stems:
+        try:
+            img7   = load_img7(stem, renders_dir)
+            img7   = _align_to_y_axis(img7)
+            attrib = compute_channel_attribution(model, img7, device, img_size)  # [4, ph, pw]
+
+            H, W = img7.shape[:2]
+            refs = [
+                np.clip(img7[:, :, :3], 0.0, 1.0),                          # top normals RGB
+                np.clip(img7[:, :, 3:6], 0.0, 1.0),                         # bottom normals RGB
+                np.clip(img7[:, :, 6:7].repeat(3, axis=2), 0.0, 1.0),       # thickness as grey RGB
+                np.clip(img7[:, :, 7:8].repeat(3, axis=2), 0.0, 1.0),       # dihedral as grey RGB
+            ]
+
+            fig, axes = plt.subplots(2, 4, figsize=(17, 8), facecolor="#0f0f1a")
+            for ax in axes.flat:
+                ax.set_facecolor("#0f0f1a")
+                ax.axis("off")
+
+            for g in range(3):
+                axes[0, g].imshow(refs[g])
+                axes[0, g].set_title(group_names[g], color="white", fontsize=9)
+
+                a = attrib[g]
+                a = (a - a.min()) / (a.max() - a.min() + 1e-8)
+                a_up = np.array(
+                    Image.fromarray((a * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR)
+                ).astype(np.float32) / 255.0
+                axes[1, g].imshow(a_up, cmap="plasma", vmin=0, vmax=1)
+                axes[1, g].set_title(f"{group_names[g]} gradient", color="white", fontsize=9)
+
+            fig.suptitle(stem, color="white", fontsize=10)
+            plt.tight_layout()
+            plt.savefig(attn_dir / f"{stem}_channel_attrib.png", dpi=120,
+                        bbox_inches="tight", facecolor=fig.get_facecolor())
+            plt.close()
+        except Exception:
+            log.warning(f"  Channel attribution failed for {stem}: {traceback.format_exc()[-200:]}")
+
+    log.info(f"Channel attribution → {attn_dir}")
+
+
+def plot_attention_overlays(
+    stems: list[str],
+    model: nn.Module,
+    renders_dir: Path,
+    out: Path,
+    device: torch.device,
+    img_size: int = IMAGE_SIZE,
+) -> list[np.ndarray]:
+    """
+    Option 1: save a 3-panel figure per stone:
+      left  — top-surface normal render
+      centre — mean CLS attention heatmap
+      right  — overlay (0.5 render + 0.5 attention)
+
+    Returns list of flattened mean attention vectors [N_patches] for option 2.
+    """
+    attn_dir = ensure_dir(out / "attention")
+    mean_attns: list[np.ndarray] = []
+
+    for stem in stems:
+        try:
+            img7       = load_img7(stem, renders_dir)
+            img7       = _align_to_y_axis(img7)                            # canonical orientation
+            attn_maps  = extract_attention(model, img7, device, img_size)  # [nh, ph, pw]
+            mean_attn  = attn_maps.mean(axis=0)                            # [ph, pw]
+            mean_attns.append(mean_attn.flatten())
+
+            top_png = np.clip(img7[:, :, :3], 0.0, 1.0)                   # aligned top normals
+            H, W    = top_png.shape[:2]
+
+            attn_up = np.array(
+                Image.fromarray(mean_attn).resize((W, H), Image.BILINEAR)
+            ).astype(np.float32)
+            attn_up = (attn_up - attn_up.min()) / (attn_up.max() - attn_up.min() + 1e-8)
+
+            overlay = np.clip(0.5 * top_png + 0.5 * plt.cm.plasma(attn_up)[:, :, :3], 0, 1)
+
+            fig, axes = plt.subplots(1, 3, figsize=(13, 4), facecolor="#0f0f1a")
+            for ax in axes:
+                ax.set_facecolor("#0f0f1a")
+                ax.axis("off")
+            axes[0].imshow(top_png);         axes[0].set_title("Top normals",   color="white", fontsize=9)
+            axes[1].imshow(attn_up, cmap="plasma", vmin=0, vmax=1)
+            axes[1].set_title("CLS attention (mean heads)", color="white", fontsize=9)
+            axes[2].imshow(overlay);         axes[2].set_title("Overlay",        color="white", fontsize=9)
+            fig.suptitle(stem, color="white", fontsize=10)
+            plt.tight_layout()
+            plt.savefig(attn_dir / f"{stem}_attn.png", dpi=120,
+                        bbox_inches="tight", facecolor=fig.get_facecolor())
+            plt.close()
+        except Exception:
+            log.warning(f"  Attention failed for {stem}: {traceback.format_exc()[-200:]}")
+
+    log.info(f"Attention overlays → {attn_dir}")
+    return mean_attns
+
+
+def plot_pc_attention_correlation(
+    stems: list[str],
+    embeddings: list[np.ndarray],
+    mean_attns: list[np.ndarray],
+    out: Path,
+    n_pcs: int = 3,
+) -> None:
+    """
+    Option 2: for each of the first n_pcs PCs, compute per-patch Pearson
+    correlation between attention weight and PC score across all stones, and
+    save as a spatial heatmap.
+    """
+    from sklearn.decomposition import PCA
+    from scipy.stats import pearsonr
+
+    E        = np.stack(embeddings)       # [N, D]
+    A        = np.stack(mean_attns)       # [N, N_patches]
+    ph = pw  = int(A.shape[1] ** 0.5)
+
+    pca      = PCA(n_components=n_pcs)
+    pc_scores = pca.fit_transform(E)      # [N, n_pcs]
+
+    attn_dir = ensure_dir(out / "attention")
+
+    for pc_idx in range(n_pcs):
+        scores   = pc_scores[:, pc_idx]
+        corr_map = np.array([
+            pearsonr(A[:, p], scores)[0] if np.std(A[:, p]) > 1e-8 else 0.0
+            for p in range(A.shape[1])
+        ]).reshape(ph, pw)
+
+        corr_up  = np.array(
+            Image.fromarray(corr_map.astype(np.float32)).resize((224, 224), Image.NEAREST)
+        )
+        var = pca.explained_variance_ratio_[pc_idx]
+
+        fig, ax = plt.subplots(figsize=(5, 5), facecolor="#0f0f1a")
+        ax.set_facecolor("#0f0f1a")
+        ax.axis("off")
+        im   = ax.imshow(corr_up, cmap="RdBu_r", vmin=-1, vmax=1)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Pearson r", color="#aaaaaa")
+        plt.setp(cbar.ax.yaxis.get_ticklabels(), color="#aaaaaa")
+        cbar.ax.yaxis.set_tick_params(color="#aaaaaa")
+        cbar.outline.set_edgecolor("#444444")
+        ax.set_title(f"PC{pc_idx+1} ({var:.1%} var) ↔ attention", color="white", fontsize=11)
+        plt.tight_layout()
+        out_path = attn_dir / f"pc{pc_idx+1}_attn_corr.png"
+        plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.close()
+        log.info(f"  -> {out_path}")
+
+
+def _run_analysis(stems, embeddings, model, renders_dir, out, device, img_size):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            mean_attns = plot_attention_overlays(stems, model, renders_dir, out, device, img_size)
+            if len(stems) >= 3 and mean_attns:
+                plot_pc_attention_correlation(stems, embeddings, mean_attns, out)
+            plot_channel_attribution(stems, model, renders_dir, out, device, img_size)
+        except Exception:
+            log.warning(f"Attention analysis failed: {traceback.format_exc()[-300:]}")
+
+
+# ---------------------------------------------------------------------------
+# Plot helpers
+# ---------------------------------------------------------------------------
+
+_MARKERS = ['o', 's', '^', 'v', 'D', 'P', 'X', 'h', '*', '8', 'p', 'H']
+
+
+def _parse_age_kya(s) -> float | None:
+    if not s:
+        return None
+    s = str(s)
+    mya = re.findall(r'([\d.]+)\s*Mya', s, re.IGNORECASE)
+    if mya:
+        vals = [float(v) * 1000 for v in mya]
+        return sum(vals) / len(vals)
+    kya = re.findall(r'(\d+)\s*Kya', s, re.IGNORECASE)
+    if kya:
+        vals = [float(v) for v in kya]
+        return sum(vals) / len(vals)
+    return None
+
+
+def _parse_altitude_m(s) -> float | None:
+    if not s:
+        return None
+    nums = [float(n) for n in re.findall(r'[\d.]+', str(s))]
+    return sum(nums) / len(nums) if nums else None
+
+
+def load_metadata_map(xlsx_path: Path) -> tuple[dict, dict]:
+    """
+    Read the site-metadata section of the new Excel (top rows, one site per row).
+    Returns (age_map, altitude_map) both keyed by site name (text before '(').
+    """
+    import pandas as pd
+    df = pd.read_excel(xlsx_path, header=None)
+    age_map, alt_map = {}, {}
+    for row_idx in range(1, len(df)):
+        val = df.iloc[row_idx, 0]
+        if not val or str(val).strip() == "":
+            continue
+        if str(val).strip().startswith("Site Name"):
+            break
+        site = str(val).split("(")[0].strip().rstrip(" -_")
+        age = _parse_age_kya(None if df.isna().iloc[row_idx, 1] else df.iloc[row_idx, 1])
+        alt = _parse_altitude_m(None if df.isna().iloc[row_idx, 3] else df.iloc[row_idx, 3])
+        if age is not None:
+            age_map[site] = age
+        if alt is not None:
+            alt_map[site] = alt
+    log.info(f"Metadata: {len(age_map)} sites with age, {len(alt_map)} with altitude")
+    return age_map, alt_map
+
+
+def plot_pca_by_continuous(
+    stems, embeddings, out, site_map, value_map, title, cbar_label, filename
+):
+    """PCA scatter: marker shape = site, color = continuous metadata value."""
+    if not value_map:
+        return
+    coords, var, _ = _scale_and_reduce(embeddings, n_components=10)
+
+    stem_sites   = [site_map.get(s, "Unknown") for s in stems]
+    unique_sites = sorted(set(stem_sites))
+    site_marker  = {site: _MARKERS[i % len(_MARKERS)] for i, site in enumerate(unique_sites)}
+    stem_values  = [value_map.get(site_map.get(s, ""), None) for s in stems]
+
+    valid = [v for v in stem_values if v is not None]
+    if not valid:
+        log.warning(f"No values for {filename} — skipping")
+        return
+
+    norm = matplotlib.colors.Normalize(vmin=min(valid), vmax=max(valid))
+    cmap = plt.cm.plasma
+
+    fig, ax = plt.subplots(figsize=(11, 8), facecolor="#0f0f1a")
+    ax.set_facecolor("#0f0f1a")
+
+    for site in unique_sites:
+        marker = site_marker[site]
+        idxs   = [i for i, s in enumerate(stem_sites) if s == site]
+        colors = [cmap(norm(stem_values[i])) if stem_values[i] is not None else "#555555"
+                  for i in idxs]
+        ax.scatter(coords[idxs, 0], coords[idxs, 1],
+                   c=colors, marker=marker, s=120, zorder=3,
+                   edgecolors="white", linewidths=0.5)
+        ax.scatter([], [], marker=marker, color="#aaaaaa", s=80,
+                   edgecolors="white", linewidths=0.5, label=site)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, pad=0.01)
+    cbar.set_label(cbar_label, color="#aaaaaa")
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="#aaaaaa")
+    cbar.ax.yaxis.set_tick_params(color="#aaaaaa")
+    cbar.outline.set_edgecolor("#444444")
+
+    leg = ax.legend(
+        title="Site", title_fontsize=8, fontsize=7,
+        facecolor="#1a1a2e", edgecolor="#444444", labelcolor="white",
+        framealpha=0.85, loc="upper left", bbox_to_anchor=(1.14, 1), borderaxespad=0,
+    )
+    leg.get_title().set_color("#aaaaaa")
+    ax.set_xlabel(f"PC1  ({var[0]:.1%} var)", color="#aaaaaa")
+    ax.set_ylabel(f"PC2  ({var[1]:.1%} var)", color="#aaaaaa")
+    ax.set_title(title, color="white", fontsize=13, pad=10)
+    ax.tick_params(colors="#666666")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333333")
+    plt.tight_layout()
+    out_path = out / filename
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    log.info(f"  -> {out_path}")
+
+
+def _run_plots(stems, embeddings, out, site_map, notes_map, seed,
+               age_map=None, altitude_map=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
@@ -760,6 +1251,18 @@ def _run_plots(stems, embeddings, out, site_map, notes_map, seed):
             plot_pca_3d(stems, embeddings, out, site_map, notes_map)
             plot_umap(stems, embeddings, out, site_map, notes_map, seed=seed)
             plot_similarity_matrix(stems, embeddings, out, site_map)
+            if site_map and age_map:
+                plot_pca_by_continuous(
+                    stems, embeddings, out, site_map, age_map,
+                    f"DINOv2-7ch — PCA  colored by age  ({len(stems)} stones)",
+                    "Age (Kya BP)", "pca_by_age.png",
+                )
+            if site_map and altitude_map:
+                plot_pca_by_continuous(
+                    stems, embeddings, out, site_map, altitude_map,
+                    f"DINOv2-7ch — PCA  colored by altitude  ({len(stems)} stones)",
+                    "Altitude (m amsl)", "pca_by_altitude.png",
+                )
         except Exception:
             log.debug(f"Plot skipped (n={len(stems)}): {traceback.format_exc()[-200:]}")
 
@@ -801,6 +1304,9 @@ def parse_args():
                    help="Directory of pre-rendered PNGs; skip Pass 2 if all renders present")
     p.add_argument("--ft_blocks",       type=int, default=2,
                    help="Transformer blocks to unfreeze during finetuning; -1 = all")
+    p.add_argument("--analysis_dir",    default=None, metavar="DIR",
+                   help="Existing timestamped run folder; load its embeddings + checkpoint "
+                        "and write attention analysis there (skips render/finetune/embed)")
     p.add_argument("--seed",            type=int, default=42)
     return p.parse_args()
 
@@ -864,7 +1370,31 @@ def _latest_run(base: Path) -> Path | None:
 def main():
     args        = parse_args()
     site_map, notes_map = _load_site_and_notes(args)
+    age_map, altitude_map = {}, {}
+    if XLSX_METADATA.exists():
+        try:
+            age_map, altitude_map = load_metadata_map(XLSX_METADATA)
+        except Exception as e:
+            log.warning(f"Could not load metadata: {e}")
     base_dir    = Path(args.output_dir)
+
+    # --analysis_dir: load existing run, run attention analysis, write into that folder
+    if args.analysis_dir:
+        out     = Path(args.analysis_dir)
+        device  = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        emb_files = sorted((out / "embeddings").glob("*.npy"))
+        if not emb_files:
+            log.error(f"No embeddings found in {out / 'embeddings'}")
+            return
+        stems      = [f.stem for f in emb_files]
+        embeddings = [np.load(f) for f in emb_files]
+        ckpt       = out / "finetune_checkpoint.pt"
+        model      = build_dino7ch(args.dino_model, checkpoint=str(ckpt) if ckpt.exists() else None,
+                                   device=device)
+        renders_dir = Path(args.renders_dir)
+        log.info(f"Analysis mode: {len(stems)} stones from {out}")
+        _run_analysis(stems, embeddings, model, renders_dir, out, device, args.image_size)
+        return
 
     # --pca_only: work on an existing stamped run, never create a new folder
     if args.pca_only:
@@ -883,7 +1413,8 @@ def main():
         stems      = [f.stem for f in files]
         embeddings = [np.load(f) for f in files]
         log.info(f"Replotting {len(stems)} embeddings from {out}")
-        _run_plots(stems, embeddings, out, site_map, notes_map, args.seed)
+        _run_plots(stems, embeddings, out, site_map, notes_map, args.seed,
+                   age_map=age_map, altitude_map=altitude_map)
         return
 
     # Normal run — create a fresh stamped folder, touch nothing else
@@ -924,7 +1455,8 @@ def main():
     # Pass 2 — render every mesh into renders_dir; skip if PNG already present
     for i, path in enumerate(files, 1):
         log.info(f"[{i}/{len(files)}] {path.stem}")
-        if (renders_dir / f"{path.stem}_top.png").exists():
+        if ((renders_dir / f"{path.stem}_top.png").exists() and
+                (renders_dir / f"{path.stem}_thick.png").exists()):
             log.info(f"  render cached — skipping")
             stems.append(path.stem)
             continue
@@ -949,6 +1481,9 @@ def main():
         model, [load_img7(stem, renders_dir) for stem in stems],
         device, img_size=args.image_size, n_unfreeze_blocks=args.ft_blocks
     )
+    ckpt_path = out / "finetune_checkpoint.pt"
+    torch.save(model.state_dict(), ckpt_path)
+    log.info(f"Checkpoint saved → {ckpt_path}")
 
     # Pass 4 — embed with finetuned model
     embeddings: list[np.ndarray] = []
@@ -965,7 +1500,9 @@ def main():
     log.info(f"Output: {out}")
 
     if len(stems) >= 2:
-        _run_plots(stems, embeddings, out, site_map, notes_map, args.seed)
+        _run_plots(stems, embeddings, out, site_map, notes_map, args.seed,
+                   age_map=age_map, altitude_map=altitude_map)
+    _run_analysis(stems, embeddings, model, renders_dir, out, device, args.image_size)
 
 
 if __name__ == "__main__":
