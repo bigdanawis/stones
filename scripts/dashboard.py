@@ -5,13 +5,14 @@ Layout
 ------
   Top-left   : PCA scatter  (click a point to inspect)
   Top-centre : Stone detail panel  (renders + metadata + similar stones)
-  Top-right  : Cosine similarity matrix  (selected row/col highlighted)
-  Bottom     : Site map placeholder  (populate SITE_COORDS to activate)
+                OR archetype vertex panel (3 closest stones) when a vertex is clicked
+  Top-right  : 3D PCA with Pareto archetype tetrahedron
+                (click a stone → highlight in 2D; click A1-A4 vertex → archetype panel)
 
 Usage
 -----
   python scripts/dashboard.py
-  python scripts/dashboard.py --run_dir outputs/dino_7ch_v2/20260624_123456
+  python scripts/dashboard.py --run_dir outputs/dino_triptych/20260624_123456
   python scripts/dashboard.py --renders_dir outputs/renders_v2 --port 8050
 """
 from __future__ import annotations
@@ -24,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from scipy.cluster.hierarchy import linkage, leaves_list
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import normalize
 
@@ -42,32 +44,20 @@ log = get_logger("dashboard")
 # Defaults
 # ---------------------------------------------------------------------------
 
-OUTPUT_BASE = ROOT / "outputs" / "dino_7ch_v2"
-RENDERS_DIR = ROOT / "outputs" / "renders"
+OUTPUT_BASE = ROOT / "outputs" / "dino_triptych"
+RENDERS_DIR = ROOT / "outputs" / "multiview_renders"
 XLSX_SITE   = ROOT / "wrl" / "Handaxes 2026 list with sites.xlsx"
 XLSX_META   = ROOT / "wrl" / "Handaxes2026list_with_sites_and_metadata.xlsx"
 
+# 6-view multiview renders  (2 rows × 3 cols in the detail panel)
 RENDER_SLOTS = [
-    ("top",      "Top normals"),
-    ("bot",      "Bottom normals"),
-    ("thick",    "Thickness"),
-    ("dihedral", "Dihedral"),
+    ("pZ", "Top (↓)"),
+    ("nZ", "Bottom (↑)"),
+    ("pX", "Right (←)"),
+    ("nX", "Left (→)"),
+    ("pY", "Front (←)"),
+    ("nY", "Back (→)"),
 ]
-
-# ---------------------------------------------------------------------------
-# Site coordinates  (lat, lon)
-# Add entries here to activate the map — keyed by the site-name prefix used
-# in site_map (text before the first '(').
-# ---------------------------------------------------------------------------
-SITE_COORDS: dict[str, tuple[float, float]] = {
-    # "Emek Refaim":          (31.760, 35.205),
-    # "Gesher Benot Ya'akov": (33.009, 35.629),
-    # "Holon":                (32.011, 34.778),
-    # "Maayan Baruch":        (33.215, 35.623),
-    # "Zihor":                (30.585, 35.046),
-    # "Jaljulia":             (32.158, 34.945),
-    # "Ubeidiya":             (32.687, 35.553),
-}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -111,7 +101,6 @@ def load_metadata(xlsx: Path) -> dict[str, dict]:
         return {}
     try:
         df = pd.read_excel(xlsx, header=0)
-        # First column = site name; remaining = metadata
         result: dict[str, dict] = {}
         for _, row in df.iterrows():
             site_val = row.iloc[0]
@@ -159,7 +148,11 @@ def load_all(run_dir: Path, renders_dir: Path,
 
     meta = load_metadata(meta_xlsx)
 
-    return stems, E, coords, var, sim, site_map, notes_map, meta
+    # Archetype data saved by dino_triptych.py plot_pca_3d (optional)
+    arch_Z = np.load(run_dir / "archetypes_Z.npy") if (run_dir / "archetypes_Z.npy").exists() else None
+    arch_S = np.load(run_dir / "archetypes_S.npy") if (run_dir / "archetypes_S.npy").exists() else None
+
+    return stems, E, coords, var, sim, site_map, notes_map, meta, arch_Z, arch_S
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +160,9 @@ def load_all(run_dir: Path, renders_dir: Path,
 # ---------------------------------------------------------------------------
 
 def _dark_layout(**kw) -> dict:
+    # Shared Plotly figure defaults. Pass height=N or margin=dict(...) to override.
+    # ↳ height: controls the pixel height of PCA figures
+    # ↳ margin l/r/t/b: inner whitespace (pixels) around the plot area
     base = dict(
         paper_bgcolor="#0f0f1a", plot_bgcolor="#0f0f1a",
         font=dict(color="white", size=11),
@@ -186,8 +182,16 @@ def build_pca(stems, coords, var, site_map, notes_map,
         fig.add_trace(go.Scatter(
             x=coords[idxs, 0], y=coords[idxs, 1],
             mode="markers", name=site,
-            marker=dict(size=9, color=color[site],
-                        line=dict(width=1, color="white")),
+            marker=dict(
+                size=9,              # ← PCA dot size (pixels)
+                color=color[site],
+                line=dict(width=1, color="white"),  # ← dot border
+            ),
+            # Suppress Plotly's default selection dimming so points look the
+            # same whether or not something is selected (we use the yellow ring
+            # for the selected stone instead).
+            selected={"marker": {"opacity": 1, "size": 9}},
+            unselected={"marker": {"opacity": 1}},
             text=[stems[i] for i in idxs],
             customdata=idxs,
             hovertemplate="<b>%{text}</b><br>" + site + "<extra></extra>",
@@ -197,91 +201,121 @@ def build_pca(stems, coords, var, site_map, notes_map,
         fig.add_trace(go.Scatter(
             x=[coords[selected_idx, 0]], y=[coords[selected_idx, 1]],
             mode="markers", name="selected", showlegend=False,
-            marker=dict(size=18, color="rgba(0,0,0,0)",
-                        line=dict(width=2.5, color="yellow")),
+            marker=dict(
+                size=18,                          # ← selection ring size
+                color="rgba(0,0,0,0)",
+                line=dict(width=2.5, color="yellow"),
+            ),
             hoverinfo="skip",
         ))
 
     n_pc = len(var)
+    # Compute axis ranges from ALL points once so they never change on click.
+    # 5% padding on each side keeps points away from the edge.
+    pad_x = (coords[:, 0].max() - coords[:, 0].min()) * 0.05 or 1
+    pad_y = (coords[:, 1].max() - coords[:, 1].min()) * 0.05 or 1
+    x_range = [coords[:, 0].min() - pad_x, coords[:, 0].max() + pad_x]
+    y_range = [coords[:, 1].min() - pad_y, coords[:, 1].max() + pad_y]
+
     fig.update_layout(
-        **_dark_layout(height=460),
+        **_dark_layout(height=640),  # ← PCA figure height (pixels)
         title=f"PCA — PC1 {var[0]:.1%} | PC2 {var[1]:.1%}",
-        xaxis=dict(title=f"PC1 ({var[0]:.1%})", gridcolor="#222", color="#aaa"),
-        yaxis=dict(title=f"PC2 ({var[1]:.1%})", gridcolor="#222", color="#aaa"),
-        legend=dict(bgcolor="#1a1a2e", bordercolor="#333", font_size=9),
-        clickmode="event",
+        xaxis=dict(title=f"PC1 ({var[0]:.1%})", gridcolor="#222", color="#aaa",
+                   range=x_range, fixedrange=True),   # ← locked; never changes on click
+        yaxis=dict(title=f"PC2 ({var[1]:.1%})", gridcolor="#222", color="#aaa",
+                   range=y_range, fixedrange=True),   # ← locked; never changes on click
+        legend=dict(
+            bgcolor="#1a1a2e", bordercolor="#333", font_size=9,
+            itemclick="toggleothers",   # ← click legend item → show only that site
+            itemdoubleclick=False,
+        ),
+        clickmode="event+select",
     )
     return fig
 
 
-def build_sim_matrix(stems, sim, selected_idx: int | None = None) -> go.Figure:
-    labels = [s[:14] for s in stems]
-    shapes = []
-    if selected_idx is not None:
-        n = len(stems)
-        for rect in [
-            dict(x0=-0.5, x1=n - 0.5, y0=selected_idx - 0.5, y1=selected_idx + 0.5),
-            dict(x0=selected_idx - 0.5, x1=selected_idx + 0.5, y0=-0.5, y1=n - 0.5),
-        ]:
-            shapes.append(dict(type="rect", xref="x", yref="y",
-                               fillcolor="rgba(255,255,0,0.12)",
-                               line=dict(color="yellow", width=1), **rect))
+def build_pca3d(stems, coords, var, site_map, notes_map,
+                arch_Z: np.ndarray | None = None,
+                arch_S: np.ndarray | None = None) -> go.Figure:
+    """Interactive 3D PCA with Pareto archetype tetrahedron.
+    Archetype vertex markers (A1-A4) are clickable — detected via text in clickData."""
+    stem_sites, unique_sites, color = _site_colors(stems, site_map)
+    coords3 = coords[:, :3]
 
-    fig = go.Figure(go.Heatmap(
-        z=sim, x=labels, y=labels,
-        colorscale="Plasma", zmin=0, zmax=1,
-        hovertemplate="<b>%{y}</b> × <b>%{x}</b><br>sim = %{z:.3f}<extra></extra>",
-    ))
-    layout = _dark_layout(height=460)
-    layout["margin"] = dict(l=90, r=10, t=45, b=90)
-    fig.update_layout(
-        **layout,
-        title="Cosine similarity",
-        xaxis=dict(tickangle=45, tickfont_size=7, color="#aaa"),
-        yaxis=dict(tickfont_size=7, color="#aaa", autorange="reversed"),
-        shapes=shapes,
-    )
-    return fig
-
-
-def build_map(unique_sites: list[str], color: dict,
-              highlight: str | None = None) -> go.Figure:
     fig = go.Figure()
 
-    known = {s: SITE_COORDS[_site_key(s)] for s in unique_sites
-             if _site_key(s) in SITE_COORDS}
-    if known:
-        for site, (lat, lon) in known.items():
-            key  = _site_key(site)
-            size = 18 if key == _site_key(highlight or "") else 10
-            bord = "yellow" if key == _site_key(highlight or "") else "white"
-            fig.add_trace(go.Scattergeo(
-                lat=[lat], lon=[lon], text=[site], mode="markers+text",
-                textposition="top center",
-                marker=dict(size=size, color=color.get(site, "#aaa"),
-                            line=dict(width=2, color=bord)),
-                showlegend=False,
-                hovertemplate="<b>%{text}</b><extra></extra>",
-            ))
-    else:
-        fig.add_annotation(
-            text="⚑  Add lat/lon to SITE_COORDS in dashboard.py to activate this map",
-            x=0.5, y=0.5, xref="paper", yref="paper",
-            showarrow=False, font=dict(size=12, color="#666"),
-        )
+    # ── stone scatter (one trace per site) ───────────────────────────────────
+    for site in unique_sites:
+        idxs = [i for i, s in enumerate(stem_sites) if s == site]
+        fig.add_trace(go.Scatter3d(
+            x=coords3[idxs, 0], y=coords3[idxs, 1], z=coords3[idxs, 2],
+            mode="markers", name=site,
+            marker=dict(size=4, color=color[site], opacity=0.75),
+            text=[stems[i] for i in idxs],
+            customdata=idxs,
+            hovertemplate="<b>%{text}</b><br>" + site + "<extra></extra>",
+        ))
 
-    hl_text = f"  —  highlighted: {highlight}" if highlight else ""
+    # ── tetrahedron ──────────────────────────────────────────────────────────
+    if arch_Z is not None:
+        x, y, z = arch_Z[:, 0], arch_Z[:, 1], arch_Z[:, 2]
+
+        # Faint translucent faces
+        fig.add_trace(go.Mesh3d(
+            x=x, y=y, z=z,
+            i=[0, 0, 0, 1], j=[1, 1, 2, 2], k=[2, 3, 3, 3],
+            color="white", opacity=0.06,
+            flatshading=True, showlegend=False, hoverinfo="skip",
+            name="simplex",
+        ))
+
+        # Glow halos (not interactive — no customdata, text, or hovertemplate)
+        for sz, op in [(32, 0.04), (18, 0.12)]:
+            fig.add_trace(go.Scatter3d(
+                x=x, y=y, z=z, mode="markers",
+                marker=dict(size=sz, color="#00e5ff", opacity=op),
+                showlegend=False, hoverinfo="skip",
+            ))
+
+        # Clickable vertex markers — identified in clickData by text="A1".."A4"
+        fig.add_trace(go.Scatter3d(
+            x=x, y=y, z=z, mode="markers+text",
+            marker=dict(
+                size=9, color="white", opacity=1.0,
+                line=dict(width=4, color="#00e5ff"),
+            ),
+            text=["A1", "A2", "A3", "A4"],
+            textfont=dict(color="#00e5ff", size=13),
+            textposition="top center",
+            name="Archetypes",
+            customdata=[0, 1, 2, 3],   # archetype index k
+            hovertemplate="<b>%{text}</b> — click to explore<extra></extra>",
+        ))
+
     fig.update_layout(
-        **_dark_layout(height=220, margin=dict(l=0, r=0, t=35, b=0)),
-        title=f"Site map{hl_text}",
-        geo=dict(
-            bgcolor="#0f0f1a", landcolor="#1a2a1a", lakecolor="#111122",
-            showland=True, showlakes=True, showcoastlines=True,
-            coastlinecolor="#333", showframe=False,
-            projection_type="natural earth",
-            center=dict(lat=32, lon=35) if not known else {},
-            projection_scale=8 if not known else 1,
+        paper_bgcolor="#0f0f1a",
+        font=dict(color="white", size=10),
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=640,  # ← 3D PCA figure height (pixels)
+        title=dict(
+            text=(f"3D PCA — {var[0]:.1%} | {var[1]:.1%} | {var[2]:.1%}"
+                  if len(var) >= 3 else "3D PCA"),
+            font=dict(size=12),
         ),
+        scene=dict(
+            bgcolor="#0a0a18",
+            xaxis=dict(title="PC1", gridcolor="#1e1e3a", color="#888",
+                       backgroundcolor="#0a0a18", showbackground=True,
+                       showspikes=False),
+            yaxis=dict(title="PC2", gridcolor="#1e1e3a", color="#888",
+                       backgroundcolor="#0a0a18", showbackground=True,
+                       showspikes=False),
+            zaxis=dict(title="PC3", gridcolor="#1e1e3a", color="#888",
+                       backgroundcolor="#0a0a18", showbackground=True,
+                       showspikes=False),
+        ),
+        legend=dict(bgcolor="#1a1a2e", bordercolor="#333", font_size=9),
+        clickmode="event",
     )
     return fig
 
@@ -291,6 +325,10 @@ def build_map(unique_sites: list[str], color: dict,
 # ---------------------------------------------------------------------------
 
 def _render_img(b64: str | None, label: str) -> html.Div:
+    # One render thumbnail inside the detail panel grid cell.
+    # Image width is 100% of its flex cell — cell width = panel width / 3.
+    # ↳ "imageRendering": "pixelated" keeps depth maps crisp (no blur smoothing)
+    # ↳ fontSize on the label: tweak the caption text size
     if b64:
         child = html.Img(
             src=f"data:image/png;base64,{b64}",
@@ -301,10 +339,10 @@ def _render_img(b64: str | None, label: str) -> html.Div:
         child = html.Div("—", style={"color": "#444", "textAlign": "center",
                                       "padding": "20px 0"})
     return html.Div([
-        html.P(label, style={"fontSize": "9px", "color": "#888",
+        html.P(label, style={"fontSize": "9px", "color": "#888",  # ← caption font size
                               "margin": "0 0 2px 0", "textAlign": "center"}),
         child,
-    ], style={"flex": "1 1 0"})
+    ], style={"flex": "1 1 0"})  # ← each image takes equal share of the row width
 
 
 def build_detail(stem: str, idx: int, stems: list[str], sim: np.ndarray,
@@ -315,11 +353,17 @@ def build_detail(stem: str, idx: int, stems: list[str], sim: np.ndarray,
     skey  = _site_key(site)
     smeta = meta.get(skey, {})
 
-    # Render images
-    imgs = [_render_img(_b64(renders_dir / f"{stem}_{rname}.png"), label)
-            for rname, label in RENDER_SLOTS]
-    render_row = html.Div(imgs, style={"display": "flex", "gap": "4px",
-                                        "marginBottom": "10px"})
+    # Render images — 2 rows × 3 cols (top/bottom/right in row 1, left/front/back in row 2)
+    # ↳ To change layout: adjust the slice indices slots[:3] / slots[3:]
+    # ↳ Gap between images: "gap" value (px) in each row's style
+    slots = [(rname, label) for rname, label in RENDER_SLOTS]
+    rows_imgs = []
+    for row_slots in [slots[:3], slots[3:]]:
+        row_imgs = [_render_img(_b64(renders_dir / f"{stem}_{rname}.png"), label)
+                    for rname, label in row_slots]
+        rows_imgs.append(html.Div(row_imgs, style={"display": "flex", "gap": "4px",  # ← gap between images (px)
+                                                    "marginBottom": "4px"}))          # ← gap between rows (px)
+    render_row = html.Div(rows_imgs, style={"marginBottom": "8px"})  # ← gap below image block
 
     # Metadata table
     rows = [("Stem",  stem), ("Site",  site)]
@@ -380,102 +424,226 @@ def build_detail(stem: str, idx: int, stems: list[str], sim: np.ndarray,
     ]
 
 
+def build_detail_archetype(k: int, stems: list[str], arch_S: np.ndarray,
+                            site_map: dict, renders_dir: Path) -> list:
+    """Detail panel for a clicked archetype vertex: show 3 closest stones."""
+    arch_label = f"A{k + 1}"
+    arch_names = {0: "Flat / Thin", 1: "Large · Round · Thick",
+                  2: "Convex / Regular", 3: "Irregular · Pointed"}
+    subtitle = arch_names.get(k, "")
+
+    weights = arch_S[:, k]
+    top3 = np.argsort(weights)[::-1][:3]
+
+    # Three stone cards side by side; each card shows top + two side-plane renders
+    ARCH_VIEWS = [("pZ", "Top"), ("pX", "Side"), ("pY", "Front")]
+    cards = []
+    for idx in top3:
+        stem = stems[idx]
+        site = site_map.get(stem, "Unknown")
+        w    = weights[idx]
+
+        thumb_row = []
+        for rname, rlabel in ARCH_VIEWS:
+            b64 = _b64(renders_dir / f"{stem}_{rname}.png")
+            thumb_row.append(html.Div([
+                html.P(rlabel, style={"fontSize": "8px", "color": "#666",
+                                      "margin": "0 0 2px", "textAlign": "center"}),
+                (html.Img(src=f"data:image/png;base64,{b64}",
+                          style={"width": "100%", "borderRadius": "3px",
+                                 "imageRendering": "pixelated", "display": "block"})
+                 if b64 else html.Div("—", style={"color": "#333",
+                                                   "textAlign": "center"})),
+            ], style={"flex": "1 1 0"}))
+
+        cards.append(html.Div([
+            html.Div(thumb_row, style={"display": "flex", "gap": "3px",
+                                       "marginBottom": "6px"}),
+            html.P(stem,  style={"fontSize": "10px", "color": "#7cf",
+                                  "margin": "0 0 2px", "textAlign": "center",
+                                  "fontWeight": "bold"}),
+            html.P(site,  style={"fontSize": "9px",  "color": "#aaa",
+                                  "margin": "0",      "textAlign": "center"}),
+            html.P(f"weight {w:.3f}", style={"fontSize": "9px", "color": "#00e5ff",
+                                              "margin": "2px 0 0",
+                                              "textAlign": "center"}),
+        ], style={
+            "flex": "1 1 0",
+            "padding": "8px 6px",
+            "backgroundColor": "#13132e",
+            "borderRadius": "7px",
+            "border": "1px solid #00e5ff33",
+        }))
+
+    return [
+        html.H4(f"Archetype {arch_label}",
+                style={"color": "#00e5ff", "margin": "0 0 2px", "fontSize": "14px"}),
+        html.P(subtitle,
+               style={"color": "#7799bb", "margin": "0 0 10px", "fontSize": "11px",
+                      "fontStyle": "italic"}),
+        html.P("3 stones closest to this archetype vertex",
+               style={"color": "#555", "fontSize": "10px", "margin": "0 0 10px"}),
+        html.Div(cards, style={"display": "flex", "gap": "8px", "marginBottom": "12px"}),
+        html.Hr(style={"borderColor": "#2a2a3e", "margin": "6px 0"}),
+        html.P("Click any stone in either PCA to restore the full detail view.",
+               style={"color": "#444", "fontSize": "9px", "textAlign": "center"}),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
 def make_app(stems, E, coords, var, sim,
-             site_map, notes_map, meta, renders_dir) -> dash.Dash:
+             site_map, notes_map, meta, renders_dir, run_dir,
+             arch_Z, arch_S) -> dash.Dash:
 
-    stem_sites, unique_sites, color = _site_colors(stems, site_map)
+    _, _, color = _site_colors(stems, site_map)
+
+    pca3d_fig = build_pca3d(stems, coords, var, site_map, notes_map, arch_Z, arch_S)
 
     app = dash.Dash(__name__, title="Stone Tool Explorer")
     app.layout = html.Div(
+        # ── page wrapper ─────────────────────────────────────────────────────
+        # padding: outer whitespace around the whole page (top/bottom left/right)
         style={"backgroundColor": "#0f0f1a", "color": "white",
                "fontFamily": "ui-monospace, monospace",
                "minHeight": "100vh", "padding": "10px 14px"},
         children=[
             html.H2("Stone Tool Embedding Explorer",
                     style={"color": "#ccc", "marginBottom": "10px",
-                           "fontSize": "16px"}),
+                           "fontSize": "16px"}),   # ← page title font size
 
-            # ── top row ──────────────────────────────────────────────────
-            html.Div(style={"display": "flex", "gap": "10px",
+            # ── top row: three panels side by side ───────────────────────────
+            # gap: horizontal space between panels (px)
+            # Each child's "flex" value controls its relative width:
+            #   "1.5 1 0" means 1.5 parts  (three panels = 1.5 + 1.5 + 1.5 = 4.5 equal thirds)
+            html.Div(style={"display": "flex", "gap": "10px",  # ← gap between panels (px)
                              "alignItems": "flex-start"}, children=[
 
-                # PCA
-                html.Div(style={"flex": "2 1 0", "minWidth": 0}, children=[
+                # ── PCA scatter (left) ────────────────────────────────────────
+                # height set inside build_pca → _dark_layout(height=640)
+                html.Div(style={"flex": "1.5 1 0", "minWidth": 0}, children=[
                     dcc.Graph(id="pca", figure=build_pca(stems, coords, var,
                                                          site_map, notes_map),
                               config={"displayModeBar": False}),
                 ]),
 
-                # Detail panel
+                # ── Detail panel (centre) ────────────────────────────────────
+                # padding: inner whitespace inside the panel box
+                # minHeight: keeps the panel tall even when empty (before click)
                 html.Div(id="detail",
-                         style={"flex": "1.4 1 0", "minWidth": 0,
+                         style={"flex": "1.5 1 0", "minWidth": 0,
                                 "backgroundColor": "#12122a",
-                                "borderRadius": "8px", "padding": "10px",
-                                "minHeight": "460px"}, children=[
+                                "borderRadius": "8px", "padding": "10px",  # ← inner padding
+                                "minHeight": "512px"}, children=[            # ← min panel height
                     html.P("Click a point in the PCA to inspect a stone.",
                            style={"color": "#555", "marginTop": "180px",
                                   "textAlign": "center"}),
                 ]),
 
-                # Similarity matrix
-                html.Div(style={"flex": "2 1 0", "minWidth": 0}, children=[
-                    dcc.Graph(id="sim", figure=build_sim_matrix(stems, sim),
+                # ── 3D PCA with archetype tetrahedron (right) ────────────────
+                # Replaces the similarity matrix.
+                # Click stone → detail panel updates; click A1-A4 → archetype panel.
+                # height set inside build_pca3d (height=640)
+                html.Div(style={"flex": "1.5 1 0", "minWidth": 0}, children=[
+                    dcc.Graph(id="pca3d", figure=pca3d_fig,
                               config={"displayModeBar": False}),
                 ]),
             ]),
 
-            # ── map ──────────────────────────────────────────────────────
-            html.Div(style={"marginTop": "10px"}, children=[
-                dcc.Graph(id="map",
-                          figure=build_map(unique_sites, color),
-                          config={"displayModeBar": False}),
-            ]),
-
+            # sel stores the current selection:
+            #   None                           → nothing selected
+            #   {"type": "stone", "idx": N}    → stone N selected (from either PCA)
+            #   {"type": "arch",  "k": K}      → archetype vertex K clicked (from 3D PCA)
             dcc.Store(id="sel", data=None),
         ],
     )
 
-    # ── store click index ─────────────────────────────────────────────────
-    @app.callback(Output("sel", "data"), Input("pca", "clickData"),
-                  prevent_initial_call=True)
-    def _store(click_data):
-        if not click_data:
+    # ── merge 2D and 3D click events into a single selection store ────────
+    @app.callback(
+        Output("sel", "data"),
+        [Input("pca",   "clickData"),
+         Input("pca3d", "clickData")],
+        prevent_initial_call=True,
+    )
+    def _store(click_2d, click_3d):
+        ctx = dash.callback_context
+        if not ctx.triggered:
             return None
-        return int(click_data["points"][0]["customdata"])
+        triggered = ctx.triggered[0]["prop_id"]
 
-    # ── update everything from stored index ───────────────────────────────
+        if "pca3d" in triggered and click_3d:
+            pt   = click_3d["points"][0]
+            text = pt.get("text", "")
+            # Archetype vertex click: text is exactly "A1".."A4"
+            if text in ("A1", "A2", "A3", "A4"):
+                return {"type": "arch", "k": int(text[1]) - 1}
+            # Stone click in 3D: customdata holds the original stone index
+            cd = pt.get("customdata")
+            if cd is not None:
+                return {"type": "stone", "idx": int(cd)}
+
+        elif "pca" in triggered and click_2d:
+            return {"type": "stone", "idx": int(click_2d["points"][0]["customdata"])}
+
+        return None
+
+    # ── restore all sites when user clicks empty 2D plot area ────────────
+    # Attaches a plotly_deselect listener each time the 2D PCA figure refreshes.
+    # clicking empty plot space fires plotly_deselect (requires clickmode='event+select').
+    app.clientside_callback(
+        """
+        function(figure) {
+            setTimeout(function() {
+                var gd = document.getElementById('pca');
+                if (!gd) return;
+                gd.removeAllListeners('plotly_deselect');
+                gd.on('plotly_deselect', function() {
+                    var n = gd.data.length;
+                    Plotly.restyle(gd, {'visible': true},
+                                   Array.from({length: n}, function(_, i) { return i; }));
+                });
+            }, 150);
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output('pca', 'className'),
+        Input('pca', 'figure'),
+    )
+
+    # ── update detail panel and 2D PCA on any click ──────────────────────
     @app.callback(
         [Output("detail", "children"),
-         Output("sim",    "figure"),
-         Output("map",    "figure"),
          Output("pca",    "figure")],
         Input("sel", "data"),
         prevent_initial_call=True,
     )
-    def _update(idx):
-        if idx is None:
+    def _update(sel):
+        if sel is None:
             return (
                 [html.P("Click a point.", style={"color": "#555"})],
-                build_sim_matrix(stems, sim),
-                build_map(unique_sites, color),
                 build_pca(stems, coords, var, site_map, notes_map),
             )
 
-        stem = stems[idx]
-        site = site_map.get(stem, "Unknown")
+        if sel.get("type") == "arch":
+            k = sel["k"]
+            if arch_S is not None:
+                detail = build_detail_archetype(k, stems, arch_S, site_map, renders_dir)
+            else:
+                detail = [html.P("Archetype data not found — run with --pca_only to generate.",
+                                 style={"color": "#f88"})]
+            # Don't change 2D PCA view for archetype clicks
+            return detail, dash.no_update
 
+        # Stone click (from 2D or 3D PCA)
+        idx  = sel["idx"]
+        stem = stems[idx]
         detail  = build_detail(stem, idx, stems, sim, site_map, notes_map,
                                meta, color, renders_dir)
-        sim_fig = build_sim_matrix(stems, sim, selected_idx=idx)
-        map_fig = build_map(unique_sites, color, highlight=site)
         pca_fig = build_pca(stems, coords, var, site_map, notes_map,
                             selected_idx=idx)
-
-        return detail, sim_fig, map_fig, pca_fig
+        return detail, pca_fig
 
     return app
 
@@ -508,14 +676,19 @@ def main():
             sys.exit(f"No run folders found under {args.output_base}")
     log.info(f"Run: {run_dir}")
 
-    stems, E, coords, var, sim, site_map, notes_map, meta = load_all(
+    stems, E, coords, var, sim, site_map, notes_map, meta, arch_Z, arch_S = load_all(
         run_dir, Path(args.renders_dir),
         Path(args.site_xlsx), Path(args.meta_xlsx),
     )
     log.info(f"{len(stems)} stones  D={E.shape[1]}")
+    if arch_Z is not None:
+        log.info(f"Archetype data loaded ({arch_Z.shape[0]} vertices)")
+    else:
+        log.info("No archetype data found — run dino_triptych.py --pca_only to generate")
 
     app = make_app(stems, E, coords, var, sim,
-                   site_map, notes_map, meta, Path(args.renders_dir))
+                   site_map, notes_map, meta, Path(args.renders_dir), run_dir,
+                   arch_Z, arch_S)
     log.info(f"Dashboard → http://localhost:{args.port}")
     app.run(debug=args.debug, port=args.port)
 
